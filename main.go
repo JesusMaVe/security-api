@@ -34,8 +34,8 @@ func requireAPIKey(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func cors(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+func corsAll(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Headers", "x-api-key, content-type")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -43,26 +43,26 @@ func cors(next http.HandlerFunc) http.HandlerFunc {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		next(w, r)
-	}
+		next.ServeHTTP(w, r)
+	})
 }
 
-func newMux() *http.ServeMux {
+func newHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
-	mux.HandleFunc("GET /api/data", cors(requireAPIKey(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /api/data", requireAPIKey(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{
 			"message": "Protected data",
 			"course":  "Security Exercise",
 			"status":  "success",
 		})
-	})))
-	mux.HandleFunc("POST /api/data", cors(requireAPIKey(func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("POST /api/data", requireAPIKey(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"message": "POST received"})
-	})))
-	return mux
+	}))
+	return corsAll(mux)
 }
 
 func main() {
@@ -71,5 +71,5 @@ func main() {
 		port = "8080"
 	}
 	log.Println("listening on :" + port)
-	log.Fatal(http.ListenAndServe(":"+port, newMux()))
+	log.Fatal(http.ListenAndServe(":"+port, newHandler()))
 }

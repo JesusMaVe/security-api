@@ -13,7 +13,7 @@ func do(method, path, key string) *httptest.ResponseRecorder {
 		req.Header.Set("x-api-key", key)
 	}
 	rec := httptest.NewRecorder()
-	newMux().ServeHTTP(rec, req)
+	newHandler().ServeHTTP(rec, req)
 	return rec
 }
 
