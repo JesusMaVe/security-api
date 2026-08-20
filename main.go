@@ -1,0 +1,75 @@
+package main
+
+import (
+	"crypto/subtle"
+	"encoding/json"
+	"log"
+	"net/http"
+	"os"
+)
+
+var apiKey = getenv("API_KEY", "dev-secret-123")
+
+func getenv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func writeJSON(w http.ResponseWriter, status int, body any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(body)
+}
+
+func requireAPIKey(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		got := r.Header.Get("x-api-key")
+		if got == "" || subtle.ConstantTimeCompare([]byte(got), []byte(apiKey)) != 1 {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
+		next(w, r)
+	}
+}
+
+func cors(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "x-api-key, content-type")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func newMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	mux.HandleFunc("GET /api/data", cors(requireAPIKey(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{
+			"message": "Protected data",
+			"course":  "Security Exercise",
+			"status":  "success",
+		})
+	})))
+	mux.HandleFunc("POST /api/data", cors(requireAPIKey(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"message": "POST received"})
+	})))
+	return mux
+}
+
+func main() {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	log.Println("listening on :" + port)
+	log.Fatal(http.ListenAndServe(":"+port, newMux()))
+}
