@@ -1,0 +1,6 @@
+# build
+security-api
+*.test
+# env — .env con secretos NO se commitea, usar .env.example como plantilla
+.env
+!.env.example

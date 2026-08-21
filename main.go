@@ -9,6 +9,7 @@ import (
 )
 
 var apiKey = getenv("API_KEY", "dev-secret-123")
+var allowOrigin = getenv("ALLOW_ORIGIN", "*")
 
 func getenv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
@@ -36,7 +37,7 @@ func requireAPIKey(next http.HandlerFunc) http.HandlerFunc {
 
 func corsAll(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Origin", allowOrigin)
 		w.Header().Set("Access-Control-Allow-Headers", "x-api-key, content-type")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		if r.Method == http.MethodOptions {
