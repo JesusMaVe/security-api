@@ -1,6 +1,6 @@
-# security-api — Backend API Key Anti-Pattern
+# security-api — Backend API Key (con BFF)
 
-Backend del ejercicio **API Key Authentication Anti-Pattern** en Go (stdlib, sin dependencias). Reproduce a propósito un mecanismo débil: autenticación por header estático `x-api-key`.
+Backend del ejercicio **API Key** en Go (stdlib). El API sigue validando `x-api-key`, pero ya no la expone al cliente — Nginx (BFF) la inyecta server-side.
 
 > **Arquitectura con Nginx:** este repo expone el API en `:8081` vía Docker. El frontend (`security-frontend`) lo consume a través de Nginx (`:8080` → `proxy_pass host.docker.internal:8081`). Ver [docs/nginx-best-practices.md](../docs/nginx-best-practices.md).
 
@@ -64,28 +64,25 @@ Error sin/inválida key: `401 {"error":"unauthorized"}` (comparación `crypto/su
 ## Tests (7 del enunciado)
 
 ```bash
-# Automáticos
+# Automáticos (validan el API tal cual)
 go test ./...   # cubre 6 escenarios HTTP
 
-# Manuales — directo (8081 Docker, 8080 si go run)
+# Manuales — directo al API (requiere key)
 curl -i http://localhost:8081/health                                          # 1: 200
 curl -i http://localhost:8081/api/data                                        # 2: 401 sin key
-curl -i -H "x-api-key: wrong-key" http://localhost:8081/api/data             # 3: 401 key mala
+curl -i -H "x-api-key: wrong-key" http://localhost:8081/api/data             # 3: 401
 curl -i -H "x-api-key: dev-secret-123" http://localhost:8081/api/data        # 4: 200
 curl -i -X POST http://localhost:8081/api/data                                # 5: 401
 curl -i -X POST -H "x-api-key: dev-secret-123" http://localhost:8081/api/data # 6: 200
-# 7: frontend — ver security-frontend/README.md (Nginx en :8080)
-
-# Vía Nginx (mismos 6, ahora por :8080)
-curl -i http://localhost:8080/health
-curl -i -H "x-api-key: dev-secret-123" http://localhost:8080/api/data
+# Vía Nginx BFF (inyecta key, sin header)
+curl -i http://localhost:8080/health                                          # 200
+curl -i http://localhost:8080/api/data                                        # 200 (BFF añade x-api-key)
+# 7: frontend — ver security-frontend/README.md
 ```
 
-## Nginx como reverse proxy
+## Nginx BFF (corrige el anti-pattern)
 
-No es parte del API, pero es el patrón recomendado: Nginx sirve el frontend y hace `proxy_pass http://host.docker.internal:8081` para `/api/` y `/health` (single-origin, sin CORS, backend oculto, punto único para headers/gzip/rate-limit/TLS futuro). Config en `security-frontend/nginx.conf`. Buenas prácticas completas en [docs/nginx-best-practices.md](../docs/nginx-best-practices.md).
-
-En prod: quitar `ports: 8081:8080` del API y dejar solo `expose: [8080]`.
+Nginx no solo es reverse proxy — es **BFF**: inyecta `proxy_set_header x-api-key "dev-secret-123"` server-side. El API sigue exigiendo la key, pero el browser ya no la ve. Config en `security-frontend/nginx.conf:25`. En prod usar `${API_KEY}` vía `envsubst` y `expose` en lugar de `ports`.
 
 ## Buenas prácticas Docker aplicadas
 
@@ -103,6 +100,6 @@ security-api/
 └── go.mod
 ```
 
-## Advertencia de seguridad
+## Seguridad
 
-Anti-pattern intencional: la clave viaja desde el cliente y es visible en DevTools → no es auth real. Con la key cualquiera tiene acceso total. No usar en producción. Evolución correcta: JWT/OAuth2 + `auth_request` en Nginx.
+Antes anti-pattern (key en cliente, visible en DevTools) — ahora corregido con BFF: key solo server-side. En prod: JWT/OAuth2 + `auth_request` en Nginx.
