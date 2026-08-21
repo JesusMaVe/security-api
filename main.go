@@ -21,7 +21,9 @@ func getenv(key, fallback string) string {
 func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(body)
+	if err := json.NewEncoder(w).Encode(body); err != nil {
+		log.Printf("writeJSON: %v", err)
+	}
 }
 
 func requireAPIKey(next http.HandlerFunc) http.HandlerFunc {
