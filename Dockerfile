@@ -1,12 +1,12 @@
 FROM golang:alpine AS builder
 WORKDIR /app
-COPY go.mod ./
+COPY go.mod go.sum ./
 RUN go mod download
 COPY . ./
 RUN CGO_ENABLED=0 go build -o /app/security-api .
 
 FROM alpine:3.20
-RUN adduser -D -u 65532 app
+RUN adduser -D -u 65532 app && mkdir -p /data /shared && chown -R app:app /data /shared
 USER app
 COPY --from=builder /app/security-api /app/security-api
 EXPOSE 8080

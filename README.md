@@ -1,19 +1,21 @@
-# security-api — Backend API Key (con BFF)
+# security-api — Backend con secret rotation + cifrado en BD (con BFF)
 
-Backend del ejercicio **API Key** en Go (stdlib). El API sigue validando `x-api-key`, pero ya no la expone al cliente — Nginx (BFF) la inyecta server-side.
+Backend del ejercicio en Go (stdlib). El API valida `x-api-key`, pero ya no la expone al cliente — el gateway OpenResty/NGINX (BFF) la inyecta server-side leyéndola de un archivo compartido que este mismo servicio actualiza cada 2 minutos.
 
-> **Arquitectura con Nginx:** este repo expone el API en `:8081` vía Docker. El frontend (`security-frontend`) lo consume a través de Nginx (`:8080` → `proxy_pass host.docker.internal:8081`). Ver [docs/nginx-best-practices.md](../docs/nginx-best-practices.md).
+> **Arquitectura:** este repo expone el API en `:8081` vía Docker. El frontend (`security-frontend`) lo consume a través del gateway OpenResty (`:8080` → `proxy_pass host.docker.internal:8081`).
 
 ```
-Browser :8080 ──▶ Nginx (frontend, :80) ──▶ Go API :8080 (interno, host :8081)
-                   │  /api/* , /health proxy_pass
+Browser :8080 ──▶ OpenResty gateway (frontend, :80) ──▶ Go API :8080 (interno, host :8081)
+                   │  /api/* (x-api-key leído de /shared/api_secret.env), /health
                    └──▶ dist/index.html (static)
+
+security-api ──▶ SQLite (/data/app.db): guarda solo texto cifrado (Fernet)
+             ──▶ /shared/api_secret.env: publica el API_SECRET vigente cada 2 min
 ```
 
 ## Requisitos
 
 - **Docker 20+** (vía recomendada) o **Go 1.22+** para `go run` directo
-- `curl` para tests manuales
 
 ## Configuración
 
@@ -21,85 +23,71 @@ Variables leídas de entorno / `.env` (ver `.env.example`):
 
 | Variable | Default | Descripción |
 |---|---|---|
-| `API_KEY` | `dev-secret-123` | Clave esperada en `x-api-key` |
+| `API_SECRET` | `dev-secret-123` | Valor inicial del secreto que protege la API. Se **rota automáticamente cada 2 minutos** (ver `secret.go`) — el valor vivo se publica en `SECRET_SHARE_PATH`, no queda fijo al env var. |
+| `DATABASE_ENCRYPTION_KEY` | clave Fernet de ejemplo | Llave usada para cifrar/descifrar los registros en SQLite. **Nunca rota** — si cambia, los registros existentes dejan de poder descifrarse. |
+| `SECRET_SHARE_PATH` | `/shared/api_secret.env` | Archivo (montado también en el gateway) donde se publica `export API_SECRET=<valor>` en cada rotación. |
+| `DB_PATH` | `/data/app.db` | Ruta del archivo SQLite. |
 | `ALLOW_ORIGIN` | `*` | CORS `Access-Control-Allow-Origin` — en prod restringir |
 | `PORT` | `8080` | Puerto interno del contenedor |
 
 ```bash
-cp .env.example .env   # ya incluido con dev-secret-123, listo para docker compose
-# En prod: edita .env con secretos reales (Vault/SSM) — .env no se commitea con reales
+cp .env.example .env
 ```
 
 ## Ejecución — Docker (recomendada)
 
+Requiere que exista `../shared/` (carpeta hermana, compartida con `security-frontend`):
+
 ```bash
+mkdir -p ../shared
 docker compose up --build -d
 curl -i http://localhost:8081/health   # 200 directo al API
 docker compose logs -f
 docker compose down
 ```
 
-El `Dockerfile` es multi-stage (`golang:alpine` → `alpine:3.20`, binario estático `CGO_ENABLED=0`, usuario no-root `65532`, `HEALTHCHECK` con `wget /health`). Ver `Dockerfile` y `.dockerignore`.
-
-## Ejecución — Go directo (sin Docker)
-
-```bash
-go run .
-# con env custom:
-API_KEY=mi-secreto PORT=9000 ALLOW_ORIGIN=http://localhost:8080 go run .
-```
-
-Escucha en `http://localhost:8080` (Docker mapea a `8081` para no chocar con Nginx en `8080`).
-
 ## Endpoints
 
 | Método | Ruta | API Key | Respuesta |
 |---|---|---|---|
 | GET | `/health` | No | `{"status":"ok"}` |
-| GET | `/api/data` | Sí (`x-api-key`) | `{"message":"Protected data","course":"Security Exercise","status":"success"}` |
-| POST | `/api/data` | Sí (`x-api-key`) | `{"message":"POST received"}` |
+| GET | `/api/data` | Sí (`x-api-key`) | Descifra y devuelve el último registro guardado: `{"message","ciphertext_in_db","course","status"}` |
+| POST | `/api/data` | Sí (`x-api-key`) | Body `{"text":"..."}`; cifra y guarda en SQLite: `{"stored":true,"id","ciphertext"}` |
 
 Error sin/inválida key: `401 {"error":"unauthorized"}` (comparación `crypto/subtle.ConstantTimeCompare`).
 
-## Tests (7 del enunciado)
+## Tests
 
 ```bash
-# Automáticos (validan el API tal cual)
-go test ./...   # cubre 6 escenarios HTTP
-
-# Manuales — directo al API (requiere key)
-curl -i http://localhost:8081/health                                          # 1: 200
-curl -i http://localhost:8081/api/data                                        # 2: 401 sin key
-curl -i -H "x-api-key: wrong-key" http://localhost:8081/api/data             # 3: 401
-curl -i -H "x-api-key: dev-secret-123" http://localhost:8081/api/data        # 4: 200
-curl -i -X POST http://localhost:8081/api/data                                # 5: 401
-curl -i -X POST -H "x-api-key: dev-secret-123" http://localhost:8081/api/data # 6: 200
-# Vía Nginx BFF (inyecta key, sin header)
-curl -i http://localhost:8080/health                                          # 200
-curl -i http://localhost:8080/api/data                                        # 200 (BFF añade x-api-key)
-# 7: frontend — ver security-frontend/README.md
+go test ./...   # health, auth, y round-trip encrypt→store→decrypt
 ```
 
-## Nginx BFF (corrige el anti-pattern)
+## Rotación del API_SECRET (cada 2 minutos)
 
-Nginx no solo es reverse proxy — es **BFF**: inyecta `proxy_set_header x-api-key "dev-secret-123"` server-side. El API sigue exigiendo la key, pero el browser ya no la ve. Config en `security-frontend/nginx.conf:25`. En prod usar `${API_KEY}` vía `envsubst` y `expose` en lugar de `ports`.
+```bash
+# Valor vivo (leído del archivo compartido, ya que un env var de proceso no puede cambiar en caliente):
+docker exec <api-container> sh -c '. /shared/api_secret.env && echo $API_SECRET'
+# Esperar ~2 min y repetir: el valor debe cambiar.
 
-## Buenas prácticas Docker aplicadas
-
-- Multi-stage, imagen mínima (~15 MB), no-root, `.dockerignore`, `HEALTHCHECK`, secretos vía `environment`/`--env-file` no en imagen.
+# La llave de cifrado NUNCA cambia:
+docker exec <api-container> printenv DATABASE_ENCRYPTION_KEY
+```
 
 ## Estructura
 
 ```
 security-api/
-├── main.go              # mux + middleware requireAPIKey + corsAll
-├── main_test.go         # httptest para los 6 escenarios
+├── main.go              # mux + middleware requireAPIKey + corsAll + handlers encrypt/store/decrypt
+├── secret.go            # rotación de API_SECRET cada 2 min, publicada en SECRET_SHARE_PATH
+├── crypto.go            # Encrypt/Decrypt Fernet con DATABASE_ENCRYPTION_KEY fijo (sin rotación)
+├── store.go             # SQLite: insertRecord / latestRecord
+├── main_test.go         # httptest: health, auth, round-trip
 ├── Dockerfile           # multi-stage
-├── docker-compose.yml   # api:8081:8080
+├── docker-compose.yml   # api:8081:8080, monta ../shared y volumen de datos
 ├── .env.example / .env  # dev defaults
 └── go.mod
 ```
 
 ## Seguridad
 
-Antes anti-pattern (key en cliente, visible en DevTools) — ahora corregido con BFF: key solo server-side. En prod: JWT/OAuth2 + `auth_request` en Nginx.
+Todos los valores en `.env.example` son **solo para laboratorio**. El `API_SECRET` rota automáticamente sin afectar al frontend (que nunca lo conoce, es inyectado server-side). El `DATABASE_ENCRYPTION_KEY` se mantiene fijo a propósito para no perder acceso a datos ya cifrados.

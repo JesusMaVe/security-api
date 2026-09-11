@@ -2,13 +2,22 @@ services:
   api:
     build: .
     environment:
-      API_KEY: ${API_KEY:-dev-secret-123}
+      API_SECRET: ${API_SECRET:-lab-rotate-me}
+      DATABASE_ENCRYPTION_KEY: ${DATABASE_ENCRYPTION_KEY:-JabvrRXnraXsyPkZFSJmlrp2a9ROBuDkaiDs/TzIM2o=}
+      SECRET_SHARE_PATH: /shared/api_secret.env
+      DB_PATH: /data/app.db
       PORT: 8080
       ALLOW_ORIGIN: ${ALLOW_ORIGIN:-*}
     ports:
       - "8081:8080"
+    volumes:
+      - ../shared:/shared
+      - api-data:/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
       interval: 5s
       retries: 5
+
+volumes:
+  api-data:
