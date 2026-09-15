@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -27,12 +28,40 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	}
 }
 
-func requireAPIKey(next http.HandlerFunc) http.HandlerFunc {
+// validAPIKey accepts the current API_SECRET or, during a rotation, the
+// previous one (the rotator updates backend.env before frontend.env).
+func validAPIKey(secrets *secretsFile, got string) bool {
+	if got == "" {
+		return false
+	}
+	for _, key := range []string{"API_SECRET", "API_SECRET_PREVIOUS"} {
+		want := secrets.Get(key)
+		if want != "" && subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+func requireAPIKey(secrets *secretsFile, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		got := r.Header.Get("x-api-key")
-		want := getAPISecret()
-		if got == "" || subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
+		if !validAPIKey(secrets, r.Header.Get("x-api-key")) {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
+		next(w, r)
+	}
+}
+
+func requireSession(sessions *sessionStore, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		c, err := r.Cookie(sessionCookie)
+		if err != nil {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "login required"})
+			return
+		}
+		if _, ok := sessions.Get(c.Value); !ok {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "login required"})
 			return
 		}
 		next(w, r)
@@ -56,13 +85,88 @@ type postBody struct {
 	Text string `json:"text"`
 }
 
-func newHandler(db *sql.DB, cs *cryptoService) http.Handler {
+type loginBody struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type deps struct {
+	db       *sql.DB
+	crypto   *cryptoService
+	secrets  *secretsFile
+	auth     authenticator
+	sessions *sessionStore
+}
+
+func newHandler(d deps) http.Handler {
+	db, cs := d.db, d.crypto
+	protected := func(h http.HandlerFunc) http.HandlerFunc {
+		return requireAPIKey(d.secrets, requireSession(d.sessions, h))
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
-	mux.HandleFunc("GET /api/data", requireAPIKey(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /api/login", requireAPIKey(d.secrets, func(w http.ResponseWriter, r *http.Request) {
+		var body loginBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid body"})
+			return
+		}
+		user, err := d.auth.Authenticate(body.Username, body.Password)
+		if errors.Is(err, errInvalidCredentials) {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"authenticated": false, "error": err.Error()})
+			return
+		}
+		if err != nil {
+			log.Printf("login: %v", err)
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "authentication service unavailable"})
+			return
+		}
+		id, err := d.sessions.Create(user)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "session failed"})
+			return
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name:     sessionCookie,
+			Value:    id,
+			Path:     "/",
+			MaxAge:   int(d.sessions.ttl.Seconds()),
+			HttpOnly: true,
+			SameSite: http.SameSiteStrictMode,
+			// ponytail: Secure: true once the gateway serves HTTPS
+		})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"authenticated": true,
+			"username":      user.Username,
+			"displayName":   user.DisplayName,
+			"mail":          user.Mail,
+		})
+	}))
+
+	mux.HandleFunc("POST /api/logout", requireAPIKey(d.secrets, func(w http.ResponseWriter, r *http.Request) {
+		if c, err := r.Cookie(sessionCookie); err == nil {
+			d.sessions.Delete(c.Value)
+		}
+		http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
+		writeJSON(w, http.StatusOK, map[string]bool{"authenticated": false})
+	}))
+
+	mux.HandleFunc("GET /api/me", protected(func(w http.ResponseWriter, r *http.Request) {
+		c, _ := r.Cookie(sessionCookie)
+		user, _ := d.sessions.Get(c.Value)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"authenticated": true,
+			"username":      user.Username,
+			"displayName":   user.DisplayName,
+			"mail":          user.Mail,
+		})
+	}))
+
+	mux.HandleFunc("GET /api/data", protected(func(w http.ResponseWriter, r *http.Request) {
 		ciphertext, err := latestRecord(db)
 		if err != nil {
 			writeJSON(w, http.StatusOK, map[string]string{
@@ -85,7 +189,7 @@ func newHandler(db *sql.DB, cs *cryptoService) http.Handler {
 		})
 	}))
 
-	mux.HandleFunc("POST /api/data", requireAPIKey(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /api/data", protected(func(w http.ResponseWriter, r *http.Request) {
 		var body postBody
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		if body.Text == "" {
@@ -123,16 +227,27 @@ func main() {
 		log.Fatalf("crypto init: %v", err)
 	}
 
-	startRotation(
-		getenv("API_SECRET", "lab-rotate-me"),
-		2*time.Minute,
-		getenv("SECRET_SHARE_PATH", "/shared/api_secret.env"),
-	)
+	// API_SECRET and LDAP_BIND_PASSWORD are rotated every 2 minutes by the
+	// external secret-rotator and re-read from this file on use.
+	secrets := newSecretsFile(getenv("SECRETS_FILE", "/shared/backend.env"))
+
+	auth := &ldapAuthenticator{
+		url:     getenv("LDAP_URL", "ldap://host.docker.internal:389"),
+		bindDN:  getenv("LDAP_BIND_DN", "cn=readonly,dc=example,dc=com"),
+		usersDN: getenv("LDAP_USERS_DN", "ou=users,dc=example,dc=com"),
+		secrets: secrets,
+	}
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 	log.Println("listening on :" + port)
-	log.Fatal(http.ListenAndServe(":"+port, newHandler(db, cs)))
+	log.Fatal(http.ListenAndServe(":"+port, newHandler(deps{
+		db:       db,
+		crypto:   cs,
+		secrets:  secrets,
+		auth:     auth,
+		sessions: newSessionStore(30 * time.Minute),
+	})))
 }

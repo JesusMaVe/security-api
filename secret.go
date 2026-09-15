@@ -1,76 +1,88 @@
 package main
 
 import (
-	"crypto/rand"
-	"encoding/hex"
-	"fmt"
+	"bufio"
 	"log"
 	"os"
-	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
 
-// currentSecret is the live API_SECRET value. It starts at the value
-// injected via the API_SECRET env var and is regenerated on a fixed
-// interval by startRotation, without needing a process restart.
-var (
-	secretMu      sync.RWMutex
-	currentSecret string
-)
+// secretsFile exposes the live values of a sourceable `export KEY=value` file
+// (/shared/backend.env). The file is rewritten by the external secret-rotator
+// every 2 minutes; it is re-parsed whenever its mtime or size changes, so a
+// rotation takes effect without restarting the process.
+type secretsFile struct {
+	path string
 
-func getAPISecret() string {
-	secretMu.RLock()
-	defer secretMu.RUnlock()
-	return currentSecret
+	mu      sync.Mutex
+	modTime time.Time
+	size    int64
+	values  map[string]string
 }
 
-func setAPISecret(v string) {
-	secretMu.Lock()
-	currentSecret = v
-	secretMu.Unlock()
+func newSecretsFile(path string) *secretsFile {
+	return &secretsFile{path: path}
 }
 
-func generateSecret() string {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		// extremely unlikely; fall back to a timestamp-derived value
-		return fmt.Sprintf("fallback-%d", time.Now().UnixNano())
+// Get returns the current value of key, falling back to the process
+// environment when the file doesn't exist or doesn't define it.
+func (s *secretsFile) Get(key string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refreshLocked(false)
+	if v, ok := s.values[key]; ok {
+		return v
 	}
-	return hex.EncodeToString(b)
+	return os.Getenv(key)
 }
 
-// writeSharedSecret writes the current secret to a shell-sourceable file so
-// other processes (the NGINX/OpenResty gateway, or `docker exec ... source
-// ... && echo $API_SECRET` for demo purposes) can read the live value
-// without the API container restarting.
-func writeSharedSecret(path, value string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return err
-	}
-	content := fmt.Sprintf("export API_SECRET=%s\n", value)
-	return os.WriteFile(path, []byte(content), 0644)
+// Reload forces a re-read, used when a credential was just rejected and the
+// rotator may have rewritten the file within the same mtime granularity.
+func (s *secretsFile) Reload() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refreshLocked(true)
 }
 
-// startRotation sets the initial secret, publishes it immediately, then
-// regenerates and republishes it every interval in the background.
-func startRotation(initial string, interval time.Duration, sharePath string) {
-	setAPISecret(initial)
-	if err := writeSharedSecret(sharePath, initial); err != nil {
-		log.Printf("secret rotation: initial write failed: %v", err)
+func (s *secretsFile) refreshLocked(force bool) {
+	info, err := os.Stat(s.path)
+	if err != nil {
+		s.values = nil
+		return
 	}
+	if !force && s.values != nil && info.ModTime().Equal(s.modTime) && info.Size() == s.size {
+		return
+	}
+	values, err := parseEnvFile(s.path)
+	if err != nil {
+		log.Printf("secrets: read %s: %v", s.path, err)
+		return
+	}
+	s.values, s.modTime, s.size = values, info.ModTime(), info.Size()
+}
 
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for range ticker.C {
-			next := generateSecret()
-			setAPISecret(next)
-			if err := writeSharedSecret(sharePath, next); err != nil {
-				log.Printf("secret rotation: write failed: %v", err)
-				continue
-			}
-			log.Println("API_SECRET rotated")
+func parseEnvFile(path string) (map[string]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	values := map[string]string{}
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
 		}
-	}()
+		line = strings.TrimPrefix(line, "export ")
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		values[strings.TrimSpace(k)] = strings.Trim(strings.TrimSpace(v), `"'`)
+	}
+	return values, sc.Err()
 }

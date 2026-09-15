@@ -1,17 +1,25 @@
 services:
   api:
     build: .
+    container_name: security-api
     environment:
-      API_SECRET: ${API_SECRET:-lab-rotate-me}
+      # API_SECRET and LDAP_BIND_PASSWORD are NOT set here: secret-rotator rotates
+      # them every 2 minutes and publishes the live values in /shared/backend.env.
+      SECRETS_FILE: /shared/backend.env
+      # Never rotated: existing rows must stay decryptable.
       DATABASE_ENCRYPTION_KEY: ${DATABASE_ENCRYPTION_KEY:-JabvrRXnraXsyPkZFSJmlrp2a9ROBuDkaiDs/TzIM2o=}
-      SECRET_SHARE_PATH: /shared/api_secret.env
+      LDAP_URL: ${LDAP_URL:-ldap://host.docker.internal:389}
+      LDAP_BIND_DN: ${LDAP_BIND_DN:-cn=readonly,dc=example,dc=com}
+      LDAP_USERS_DN: ${LDAP_USERS_DN:-ou=users,dc=example,dc=com}
       DB_PATH: /data/app.db
       PORT: 8080
       ALLOW_ORIGIN: ${ALLOW_ORIGIN:-*}
     ports:
       - "8081:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
-      - ../shared:/shared
+      - ../shared:/shared:ro
       - api-data:/data
     restart: unless-stopped
     healthcheck:
