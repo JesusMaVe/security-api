@@ -90,6 +90,31 @@ type loginBody struct {
 	Password string `json:"password"`
 }
 
+// startSession creates a session for user, sets the HttpOnly cookie and
+// writes the user as JSON.
+func startSession(w http.ResponseWriter, sessions *sessionStore, user ldapUser, status int) {
+	id, err := sessions.Create(user)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "session failed"})
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    id,
+		Path:     "/",
+		MaxAge:   int(sessions.ttl.Seconds()),
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		// ponytail: Secure: true once the gateway serves HTTPS
+	})
+	writeJSON(w, status, map[string]any{
+		"authenticated": true,
+		"username":      user.Username,
+		"displayName":   user.DisplayName,
+		"mail":          user.Mail,
+	})
+}
+
 type deps struct {
 	db       *sql.DB
 	crypto   *cryptoService
@@ -125,26 +150,32 @@ func newHandler(d deps) http.Handler {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "authentication service unavailable"})
 			return
 		}
-		id, err := d.sessions.Create(user)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "session failed"})
+		startSession(w, d.sessions, user, http.StatusOK)
+	}))
+
+	mux.HandleFunc("POST /api/register", requireAPIKey(d.secrets, func(w http.ResponseWriter, r *http.Request) {
+		var body registerBody
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid body"})
 			return
 		}
-		http.SetCookie(w, &http.Cookie{
-			Name:     sessionCookie,
-			Value:    id,
-			Path:     "/",
-			MaxAge:   int(d.sessions.ttl.Seconds()),
-			HttpOnly: true,
-			SameSite: http.SameSiteStrictMode,
-			// ponytail: Secure: true once the gateway serves HTTPS
-		})
-		writeJSON(w, http.StatusOK, map[string]any{
-			"authenticated": true,
-			"username":      user.Username,
-			"displayName":   user.DisplayName,
-			"mail":          user.Mail,
-		})
+		u, msg := validateRegistration(body)
+		if msg != "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg})
+			return
+		}
+		user, err := d.auth.Register(u)
+		if errors.Is(err, errUserExists) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			return
+		}
+		if err != nil {
+			log.Printf("register: %v", err)
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "directory service unavailable"})
+			return
+		}
+		// registration logs the new user in
+		startSession(w, d.sessions, user, http.StatusCreated)
 	}))
 
 	mux.HandleFunc("POST /api/logout", requireAPIKey(d.secrets, func(w http.ResponseWriter, r *http.Request) {
@@ -232,10 +263,11 @@ func main() {
 	secrets := newSecretsFile(getenv("SECRETS_FILE", "/shared/backend.env"))
 
 	auth := &ldapAuthenticator{
-		url:     getenv("LDAP_URL", "ldap://host.docker.internal:389"),
-		bindDN:  getenv("LDAP_BIND_DN", "cn=readonly,dc=example,dc=com"),
-		usersDN: getenv("LDAP_USERS_DN", "ou=users,dc=example,dc=com"),
-		secrets: secrets,
+		url:         getenv("LDAP_URL", "ldap://host.docker.internal:389"),
+		bindDN:      getenv("LDAP_BIND_DN", "cn=readonly,dc=example,dc=com"),
+		registrarDN: getenv("LDAP_REGISTRAR_DN", "cn=registrar,dc=example,dc=com"),
+		usersDN:     getenv("LDAP_USERS_DN", "ou=users,dc=example,dc=com"),
+		secrets:     secrets,
 	}
 
 	port := os.Getenv("PORT")

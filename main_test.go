@@ -15,14 +15,33 @@ import (
 const testSecret = "dev-secret-123"
 const testEncryptionKey = "JabvrRXnraXsyPkZFSJmlrp2a9ROBuDkaiDs/TzIM2o="
 
-// fakeAuth accepts alice/alice123 only.
-type fakeAuth struct{}
+// fakeAuth is an in-memory directory seeded with alice/alice123.
+type fakeAuth struct {
+	passwords map[string]string
+	users     map[string]ldapUser
+}
 
-func (fakeAuth) Authenticate(username, password string) (ldapUser, error) {
-	if username == "alice" && password == "alice123" {
-		return ldapUser{Username: "alice", DisplayName: "Alice Smith", Mail: "alice@example.com"}, nil
+func newFakeAuth() *fakeAuth {
+	return &fakeAuth{
+		passwords: map[string]string{"alice": "alice123"},
+		users:     map[string]ldapUser{"alice": {Username: "alice", DisplayName: "Alice Smith", Mail: "alice@example.com"}},
+	}
+}
+
+func (f *fakeAuth) Authenticate(username, password string) (ldapUser, error) {
+	if pw, ok := f.passwords[username]; ok && password != "" && pw == password {
+		return f.users[username], nil
 	}
 	return ldapUser{}, errInvalidCredentials
+}
+
+func (f *fakeAuth) Register(u newUser) (ldapUser, error) {
+	if _, ok := f.users[u.Username]; ok {
+		return ldapUser{}, errUserExists
+	}
+	user := ldapUser{Username: u.Username, DisplayName: u.GivenName + " " + u.Surname, Mail: u.Mail}
+	f.passwords[u.Username], f.users[u.Username] = u.Password, user
+	return user, nil
 }
 
 func writeSecrets(t *testing.T, path, content string) {
@@ -47,7 +66,7 @@ func testHandler(t *testing.T) (http.Handler, *sql.DB, string) {
 		db:       db,
 		crypto:   cs,
 		secrets:  newSecretsFile(secretsPath),
-		auth:     fakeAuth{},
+		auth:     newFakeAuth(),
 		sessions: newSessionStore(time.Minute),
 	})
 	return h, db, secretsPath
@@ -121,6 +140,62 @@ func TestLogin(t *testing.T) {
 	}
 	if rec := do(h, http.MethodGet, "/api/me", testSecret, sid, ""); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("me after logout: expected 401, got %d", rec.Code)
+	}
+}
+
+func TestRegister(t *testing.T) {
+	h, db, _ := testHandler(t)
+	defer db.Close()
+	valid := `{"username":"Carol","password":"carol-pass-1","givenName":"Carol","sn":"Diaz","mail":"carol@example.com"}`
+
+	if rec := do(h, http.MethodPost, "/api/register", "", "", valid); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without api key, got %d", rec.Code)
+	}
+
+	for name, body := range map[string]string{
+		"bad username": `{"username":"x*","password":"carol-pass-1","givenName":"C","sn":"D","mail":"c@example.com"}`,
+		"dn injection": `{"username":"carol,ou=groups","password":"carol-pass-1","givenName":"C","sn":"D","mail":"c@example.com"}`,
+		"short pass":   `{"username":"carol","password":"short","givenName":"C","sn":"D","mail":"c@example.com"}`,
+		"missing name": `{"username":"carol","password":"carol-pass-1","givenName":" ","sn":"D","mail":"c@example.com"}`,
+		"bad mail":     `{"username":"carol","password":"carol-pass-1","givenName":"C","sn":"D","mail":"not-an-email"}`,
+		"invalid json": `{`,
+	} {
+		if rec := do(h, http.MethodPost, "/api/register", testSecret, "", body); rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: expected 400, got %d: %s", name, rec.Code, rec.Body.String())
+		}
+	}
+
+	rec := do(h, http.MethodPost, "/api/register", testSecret, "", valid)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("register: expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body["username"] != "carol" {
+		t.Fatalf("register: username should be normalized to lowercase, got %s", rec.Body.String())
+	}
+	var sid string
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == sessionCookie {
+			sid = c.Value
+		}
+	}
+	if rec := do(h, http.MethodGet, "/api/data", testSecret, sid, ""); rec.Code != http.StatusOK {
+		t.Fatalf("register should log the user in, got %d", rec.Code)
+	}
+
+	if rec := do(h, http.MethodPost, "/api/register", testSecret, "", valid); rec.Code != http.StatusConflict {
+		t.Fatalf("duplicate: expected 409, got %d", rec.Code)
+	}
+	if rec := do(h, http.MethodPost, "/api/login", testSecret, "", `{"username":"carol","password":"carol-pass-1"}`); rec.Code != http.StatusOK {
+		t.Fatalf("login as registered user: expected 200, got %d", rec.Code)
+	}
+}
+
+func TestSSHAHash(t *testing.T) {
+	a, _ := sshaHash("secret")
+	b, _ := sshaHash("secret")
+	if !strings.HasPrefix(a, "{SSHA}") || a == b || strings.Contains(a, "secret") {
+		t.Fatalf("expected salted {SSHA} hashes, got %q and %q", a, b)
 	}
 }
 

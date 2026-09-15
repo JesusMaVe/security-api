@@ -1,15 +1,15 @@
 # security-api — Backend con login LDAP, secrets rotados y cifrado en BD
 
-Backend del ejercicio en Go. Autentica usuarios contra OpenLDAP (repo `security-ldap`), protege la API con `x-api-key` (inyectada server-side por el gateway BFF) y guarda datos cifrados con Fernet en SQLite.
+Backend del ejercicio en Go. Registra y autentica usuarios contra OpenLDAP (repo `security-ldap`), protege la API con `x-api-key` (inyectada server-side por el gateway BFF) y guarda datos cifrados con Fernet en SQLite.
 
 Los secrets **ya no se rotan dentro de la app**: los rota el repo `secret-rotator` cada 2 minutos y los publica en `/shared/backend.env`, que este servicio relee en caliente.
 
 ```
 Browser :8080 ──▶ OpenResty gateway (security-frontend) ──▶ Go API :8080 (host :8081)
                    /api/* + x-api-key (de /shared/frontend.env)     │
-                                                                    ├─▶ OpenLDAP :389 (search-then-bind)
+                                                                    ├─▶ OpenLDAP :389 (login: readonly · registro: registrar)
                                                                     ├─▶ SQLite /data/app.db (solo texto cifrado)
-                                                                    └─◀ /shared/backend.env (API_SECRET, LDAP_BIND_PASSWORD)
+                                                                    └─◀ /shared/backend.env (API_SECRET, LDAP_BIND_PASSWORD, LDAP_REGISTRAR_PASSWORD)
 ```
 
 ## Requisitos
@@ -21,10 +21,11 @@ Browser :8080 ──▶ OpenResty gateway (security-frontend) ──▶ Go API :
 
 | Variable | Default | Descripción |
 |---|---|---|
-| `SECRETS_FILE` | `/shared/backend.env` | Archivo `export K=V` escrito por `secret-rotator`. Se relee cuando cambia (mtime). Contiene `API_SECRET`, `API_SECRET_PREVIOUS`, `LDAP_BIND_PASSWORD`. |
+| `SECRETS_FILE` | `/shared/backend.env` | Archivo `export K=V` escrito por `secret-rotator`. Se relee cuando cambia (mtime). Contiene `API_SECRET`, `API_SECRET_PREVIOUS`, `LDAP_BIND_PASSWORD`, `LDAP_REGISTRAR_PASSWORD`. |
 | `DATABASE_ENCRYPTION_KEY` | clave Fernet de ejemplo | Cifra/descifra registros en SQLite. **Nunca rota.** |
 | `LDAP_URL` | `ldap://host.docker.internal:389` | Servidor LDAP |
 | `LDAP_BIND_DN` | `cn=readonly,dc=example,dc=com` | Cuenta de servicio para buscar usuarios |
+| `LDAP_REGISTRAR_DN` | `cn=registrar,dc=example,dc=com` | Cuenta add-only para crear usuarios |
 | `LDAP_USERS_DN` | `ou=users,dc=example,dc=com` | Base de búsqueda de usuarios |
 | `DB_PATH` | `/data/app.db` | SQLite |
 | `ALLOW_ORIGIN` | `*` | CORS — en prod restringir |
@@ -47,6 +48,7 @@ curl -i http://localhost:8081/health
 |---|---|---|---|---|
 | GET | `/health` | No | No | `{"status":"ok"}` |
 | POST | `/api/login` | Sí | No | Body `{"username","password"}` → `200 {authenticated,username,displayName,mail}` + cookie `session` (HttpOnly, SameSite=Strict) / `401` |
+| POST | `/api/register` | Sí | No | Body `{"username","password","givenName","sn","mail"}` → `201` + cookie `session` (queda logueado) / `400` validación / `409` usuario existente |
 | POST | `/api/logout` | Sí | — | Borra la sesión |
 | GET | `/api/me` | Sí | Sí | Usuario de la sesión |
 | GET | `/api/data` | Sí | Sí | Descifra y devuelve el último registro |
@@ -61,6 +63,17 @@ Errores: key inválida → `401 {"error":"unauthorized"}`; sin sesión → `401 
 3. Bind con el DN encontrado y el password del usuario. Password vacío se rechaza.
 4. Crea una sesión aleatoria en memoria (30 min). No hay secret de firma, por lo que la rotación no invalida sesiones.
 
+### Registro
+
+1. Valida y normaliza: `username` 3-32 (`[a-z][a-z0-9._-]`, se pasa a minúsculas — seguro para DN y filtros), `password` 8-128, nombre y apellido (≤ 64), email válido.
+2. Hashea el password (`{SSHA}` con salt aleatorio).
+3. Bind como `LDAP_REGISTRAR_DN` con `LDAP_REGISTRAR_PASSWORD` vigente (con el mismo reintento que el login) y `Add` de `uid=<username>,ou=users,...` (`inetOrgPerson`). Si ya existe → `409`.
+4. Crea la sesión: el usuario queda logueado.
+
+La cuenta registrar solo tiene permiso de **crear** en `ou=users` (ver `security-ldap/README.md`), así que un fallo en el backend no permite modificar ni borrar usuarios existentes.
+
+> ponytail: sin rate limiting ni verificación de email — suficiente para el laboratorio.
+
 ### Rotación del `API_SECRET` sin cortes
 
 Se acepta `API_SECRET` **o** `API_SECRET_PREVIOUS` (comparación en tiempo constante). El rotador escribe `backend.env` antes que `frontend.env`, así que el gateway nunca queda con una key rechazada.
@@ -68,7 +81,7 @@ Se acepta `API_SECRET` **o** `API_SECRET_PREVIOUS` (comparación en tiempo const
 ## Tests
 
 ```bash
-go test ./...   # health, login/logout/me, auth por key y sesión, round-trip cifrado, rotación de key
+go test ./...   # health, login/logout/me, registro (validación, 409, auto-login), auth por key y sesión, round-trip cifrado, rotación de key
 ```
 
 ## Ver los secrets
@@ -82,9 +95,10 @@ docker exec security-api printenv DATABASE_ENCRYPTION_KEY   # no cambia
 
 ```
 security-api/
-├── main.go            # rutas, requireAPIKey (actual+previous), requireSession, login/logout/me, data
+├── main.go            # rutas, requireAPIKey (actual+previous), requireSession, login/register/logout/me, data
 ├── secret.go          # lector de SECRETS_FILE con recarga por mtime
-├── ldap.go            # authenticator LDAP (go-ldap/v3): search-then-bind
+├── ldap.go            # LDAP (go-ldap/v3): login search-then-bind, registro (add + {SSHA})
+├── register.go        # validación del body de /api/register
 ├── session.go         # sesiones opacas en memoria
 ├── crypto.go          # Fernet con DATABASE_ENCRYPTION_KEY fijo
 ├── store.go           # SQLite

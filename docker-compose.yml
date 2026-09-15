@@ -3,13 +3,14 @@ services:
     build: .
     container_name: security-api
     environment:
-      # API_SECRET and LDAP_BIND_PASSWORD are NOT set here: secret-rotator rotates
+      # API_SECRET, LDAP_BIND_PASSWORD and LDAP_REGISTRAR_PASSWORD are NOT set here: secret-rotator rotates
       # them every 2 minutes and publishes the live values in /shared/backend.env.
       SECRETS_FILE: /shared/backend.env
       # Never rotated: existing rows must stay decryptable.
       DATABASE_ENCRYPTION_KEY: ${DATABASE_ENCRYPTION_KEY:-JabvrRXnraXsyPkZFSJmlrp2a9ROBuDkaiDs/TzIM2o=}
       LDAP_URL: ${LDAP_URL:-ldap://host.docker.internal:389}
       LDAP_BIND_DN: ${LDAP_BIND_DN:-cn=readonly,dc=example,dc=com}
+      LDAP_REGISTRAR_DN: ${LDAP_REGISTRAR_DN:-cn=registrar,dc=example,dc=com}
       LDAP_USERS_DN: ${LDAP_USERS_DN:-ou=users,dc=example,dc=com}
       DB_PATH: /data/app.db
       PORT: 8080
